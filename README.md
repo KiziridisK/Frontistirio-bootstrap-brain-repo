@@ -119,8 +119,28 @@ Note: student only gets their **own** courses and classes, not the store's full 
 ### Branch: `parent`
 Not yet implemented — only logs "fetching bootstrap data of parent".
 
-### Branch: `teacher`
-Not yet implemented — only logs "fetching bootstrap data of teacher".
+### Branch: `teacher` (implemented 2026-07-06)
+Scoped to the teacher's own assignments for the default period. Steps:
+```javascript
+const teacher = await teachersHandler.getTeacherByUserId(userId);            // "me"
+const { courseIds, classIds, studentIds } =                                 // sync, from period_courses
+  teachersHandler.getTeacherPeriodAssignmentIds(teacher, periodId);
+
+// Fetch the SAME period-scoped store collections the store-user gets, then FILTER
+// to the teacher's subset (guarantees identical shape for the shared components/gradebook):
+fetchStorePeriodStudents / fetchStorePeriodCourses / fetchStorePeriodClasses,
+fetchStoreGrades, getGradeCategories, getGradeScenarios, getGradeScales,
+fetchStoreTeachingPeriods, getStore, GetStoreSettings, findUserById,
+educationalMaterialHandler.getTeacherEducationalMaterials(storeId, userId, periodId); // own uploads
+```
+Filtering: `courses`/`classes` kept if their `_id ∈ courseIds/classIds`; `students` kept if
+`_id ∈ studentIds` (private-lesson students) **OR** their active-period `period_class` ∈ `classIds`.
+Returns `teachers: [teacher]` so the frontend resolves "me" by `user_id`. Test cycles are NOT in
+bootstrap — the teacher home loads upcoming ones lazily (mirrors student), see test-cycles brain repo.
+
+Response keys: `{ success, students, courses, classes, grades, user, gradeCategories, teachers,
+teaching_periods, educational_materials, stores, gradeScenarios, gradeScales, store_settings }`.
+See the **teacher-management** brain repo for the full teacher-portal picture.
 
 ---
 
@@ -224,5 +244,6 @@ If a store-user logs in and sees empty lists:
 |---|---|
 | Empty students/courses/classes after login | No default teaching period set |
 | `error getting bootstrap data` in logs | Unhandled exception in one of the 15 parallel queries; check server logs |
-| `parent`/`teacher` role gets empty response | Not implemented — falls through all if-branches |
+| `parent` role gets empty response | Not implemented — falls through all if-branches |
+| `teacher` sees empty lists | Teacher has no `period_courses` for the default period (nothing assigned yet), OR their login isn't linked to a Teacher doc (`getTeacherByUserId` null) |
 | Student sees no materials | `getStudentEducationalMaterial` found no materials matching student's grade/class in `period_permissions` |
