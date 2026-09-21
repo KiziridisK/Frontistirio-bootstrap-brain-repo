@@ -4,6 +4,21 @@
 
 ---
 
+## Change log
+
+### 2026-09-21 — corrections (verified against API `93b4079`)
+This README had three statements that were no longer true:
+- **The `parent` branch IS implemented** (since 2026-07-14). It previously said "Not yet implemented". See [Branch: `parent`](#branch-parent).
+- **The `student` branch no longer reads only `student.period_courses`.** Since BS-05 (2026-07-17) the courses are the union of the
+  student's own courses and their τμήμα's (`syllabusHandler.getStudentPeriodCourseIds`). The lookups are also null-safe now.
+- **The period is `resolveActivePeriod(req)`, not `getStoreDefaultPeriod`.** It is the store default for every role, except a store-user
+  who has entered another period (admin active-period override, see the authentication brain repo).
+
+Student and parent responses now also carry `store_settings` = **branding only** (`GetStoreBranding`), so they see the store's logo
+and colours. The store-user and the teacher get the full settings (`GetStoreSettings`).
+
+---
+
 ## What Bootstrap Does
 
 Instead of 15 separate API calls on app load, a single `GET /bootstrap/getSingle` loads everything the frontend needs and populates the entire NgRx store. The response shape is **role-dependent** — the backend reads the JWT, detects the role, and returns only what that role needs.
@@ -28,10 +43,12 @@ exports.getSingle = async (req, res) => {
   const userId = req.user.id;
   const userRole = req.user.role;
 
-  // Get default period for all non-superadmin roles
+  // Active period for all non-superadmin roles. resolveActivePeriod returns the
+  // store default, except for a store-user with a personal override
+  // (User.active_period / JWT claim) — teachers/students/parents always get the default.
   let default_period;
   if (userRole !== 'superadmin') {
-    default_period = await teachinPeriodHandler.getStoreDefaultPeriod(req.user?.store);
+    default_period = await teachinPeriodHandler.resolveActivePeriod(req);
   }
   const periodId = default_period?._id;
   // ...
@@ -94,30 +111,53 @@ Response:
 // 1. Fetch the student document by user_id, filtered to current period
 const student = await studentHandler.getStudentByUserId(userId, default_period._id);
 
-// 2. Find the student's courses and class for this period
-const period_courses = student.period_courses.find(
-  pc => pc.period.toString() === default_period._id.toString()
-);
-const period_classes = student.period_class.find(
-  pc => pc.period.toString() === default_period._id.toString()
-);
+// 2. Class + courses for this period — both may be missing (assignment is optional),
+//    so everything is null-safe (`student?.period_class`, empty id lists).
+const period_classes = _.find(student?.period_class, pc => pc.period.toString() === periodId.toString());
+// Courses = the UNION of the student's own period_courses (ιδιαίτερα) and the courses
+// of their τμήμα (ClassModel.period_courses, never copied onto the student). BS-05.
+const courseIds = student ? await syllabusHandler.getStudentPeriodCourseIds(student, periodId) : [];
+const classIds = period_classes?.classes ? [period_classes.classes] : [];
 
-// 3. 6 parallel queries for only what the student needs
-promises.push(classesHandler.getClassesByIds([period_classes.classes]));
-promises.push(coursesHandler.getCoursesById(period_courses.courses, storeId));
-promises.push(userHandler.findUserById(userId));
-promises.push(storeHandler.getStore(storeId));
-promises.push(educationalMaterialHandler.getStudentEducationalMaterial(storeId, student, periodId));
-promises.push(teachinPeriodHandler.fetchStoreTeachingPeriods(storeId));
-promises.push(gradersHandler.fetchStoreGrades(storeId));
+// 3. 8 parallel queries for only what the student needs
+promises.push(classesHandler.getClassesByIds(classIds));                         // 0
+promises.push(coursesHandler.getCoursesById(courseIds, storeId));                // 1
+promises.push(userHandler.findUserById(userId));                                 // 2
+promises.push(storeHandler.getStore(storeId));                                   // 3
+promises.push(student ? educationalMaterialHandler.getStudentEducationalMaterial(storeId, student, periodId) : []); // 4
+promises.push(teachinPeriodHandler.fetchStoreTeachingPeriods(storeId));          // 5
+promises.push(gradersHandler.fetchStoreGrades(storeId));                         // 6
+promises.push(storeSettingsHandler.GetStoreBranding(storeId));                   // 7 — branding only
 ```
 
-Response: `{ success, students: [student], courses, classes, educational_materials, grades, user, stores, teaching_periods }`
+Response: `{ success, students: [student] | [], courses, classes, educational_materials, grades, user, stores, teaching_periods, store_settings }`
 
-Note: student only gets their **own** courses and classes, not the store's full list. Educational materials are filtered by `getStudentEducationalMaterial` which checks `period_permissions`.
+Note: the student only gets their **own** courses and classes, not the store's full list. Educational materials are filtered by
+`getStudentEducationalMaterial`, which checks `period_permissions`. Its course-level check still reads only `student.period_courses`
+(BUG-013, open). Material attached to a course syllabus is reachable anyway; see the course-syllabus brain repo.
 
-### Branch: `parent`
-Not yet implemented — only logs "fetching bootstrap data of parent".
+### Branch: `parent` (implemented 2026-07-14)
+The parent sees the **same shapes as the student**, scoped to their **children**:
+```javascript
+const parentIds = await parentsHandler.getParentIdsByUserId(userId);      // Parent docs of this login
+const kids = await studentHandler.getStudentsByParentIds(parentIds, storeId); // reverse lookup on Student.parents.father/mother
+// → kidIdSet
+
+// Fetch the SAME period-scoped store collections as student/teacher, then FILTER:
+fetchStorePeriodStudents / fetchStorePeriodCourses / fetchStorePeriodClasses,
+fetchStoreGrades, findUserById, fetchStoreTeachingPeriods, getStore, GetStoreBranding
+```
+- `students` = only the children.
+- `courses` = the union over the children of **`getStudentPeriodCourseIds`** (own ∪ τμήμα). `classes` = the children's τμήματα.
+- `educational_materials` = the union of each child's `getStudentEducationalMaterial`, deduplicated by id.
+- `parents` = `getParentsByUserId(userId)`. It is **not dispatched to any NgRx slice**. The frontend resolves the parent's name
+  from the children's populated `parents.father/mother` (matching `user_id`).
+
+Response: `{ success, students, courses, classes, grades, user, teaching_periods, educational_materials, stores, parents, store_settings }`
+
+**Resolution is a reverse lookup** on `Student.parents.father/.mother`. The `Parent.kids` array was historically empty. It is now
+`$addToSet` when a parent login is linked, but reads do not rely on it. A `Parent` document is created **per student**, so today one parent
+login maps to one child. See the student-management brain repo, «Parent portal».
 
 ### Branch: `teacher` (implemented 2026-07-06)
 Scoped to the teacher's own assignments for the default period. Steps:
@@ -229,7 +269,8 @@ For students: also fetches upcoming test cycles via `studentsService.getStoreStu
 
 ## Critical: Default Period Dependency
 
-**Everything in bootstrap is scoped to `TeachingPeriod.default === true` for the store.**
+**Everything in bootstrap is scoped to `TeachingPeriod.default === true` for the store**, except a store-user who has entered
+another period (`resolveActivePeriod` then returns that period).
 
 If a store-user logs in and sees empty lists:
 1. Check if the store has a period where `default: true` — if not, `getStoreDefaultPeriod` returns null and the bootstrap will return empty arrays
@@ -244,6 +285,7 @@ If a store-user logs in and sees empty lists:
 |---|---|
 | Empty students/courses/classes after login | No default teaching period set |
 | `error getting bootstrap data` in logs | Unhandled exception in one of the 15 parallel queries; check server logs |
-| `parent` role gets empty response | Not implemented — falls through all if-branches |
+| `parent` sees no children | The login's `User._id` is not on any `Parent.user_id`, or no `Student.parents.father/mother` points to that Parent (the link is made by `register-parent-user`) |
+| Student/parent sees no courses although the τμήμα has them | Code that reads only `student.period_courses`; use `getStudentPeriodCourseIds` (BS-05) |
 | `teacher` sees empty lists | Teacher has no `period_courses` for the default period (nothing assigned yet), OR their login isn't linked to a Teacher doc (`getTeacherByUserId` null) |
 | Student sees no materials | `getStudentEducationalMaterial` found no materials matching student's grade/class in `period_permissions` |
